@@ -1,0 +1,36 @@
+Known Issues — NYC Taxi Pipeline
+===================================
+
+1. DATETIME FORMAT VARIANCE
+   - Pre-2022 files use format: "YYYY-MM-DD HH:MM:SS"
+   - Some vendor exports use: "M/D/YYYY H:MM" (no zero-padding)
+   - Fix: pass format=None or use pd.to_datetime with infer_datetime_format=True
+
+2. NEGATIVE FARE AMOUNTS
+   - TLC raw exports occasionally include dispute/reversal rows with fare_amount < 0
+   - These are legitimate records but violate our schema constraint
+   - Fix: filter out rows where fare_amount < 0 with a warning, not a hard fail
+   - Volume threshold: flag as anomaly if > 0.5% of batch
+
+3. PAYMENT TYPE CODES
+   - Code 0 appears in some 2023 Q1 exports (undocumented, treat as Unknown/5)
+   - Codes > 6 seen in vendor 2 data occasionally; map to 5 (Unknown)
+   - Fix: coerce unknown codes to 5 before validation
+
+4. NULL PASSENGER COUNT
+   - ~2% of rows have null passenger_count in raw data
+   - Policy: impute with 1 for trips with trip_distance > 0, else drop
+   - Do not drop entire batch on this — it's expected data quality noise
+
+5. DUPLICATE ROWS
+   - Some monthly files overlap with the previous month's last few hours
+   - No dedup key exists; use (tpep_pickup_datetime, PULocationID, DOLocationID, total_amount)
+   - Fix: deduplicate before writing; use if_exists="append" not "replace"
+
+6. CONNECTION TIMEOUTS
+   - Postgres connection drops after ~30 min idle during large loads
+   - Fix: use connection pool with pool_pre_ping=True in create_engine()
+
+7. COLUMN NAME DRIFT
+   - 2024+ exports renamed "improvement_surcharge" → "improvement_surcharge_amount"
+   - Fix: normalize column names with .str.lower().str.replace(" ", "_") before processing

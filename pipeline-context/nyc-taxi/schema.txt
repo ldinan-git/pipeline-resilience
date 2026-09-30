@@ -1,0 +1,28 @@
+Table: taxi_trips
+Primary key: none (append-only)
+
+Columns:
+  VendorID            INTEGER        -- 1=Creative Mobile, 2=VeriFone
+  tpep_pickup_datetime  TIMESTAMP    NOT NULL
+  tpep_dropoff_datetime TIMESTAMP    NOT NULL
+  passenger_count     FLOAT          NOT NULL  -- nullable in raw CSV
+  trip_distance       FLOAT          NOT NULL
+  RatecodeID          FLOAT
+  store_and_fwd_flag  TEXT           -- 'Y' or 'N'
+  PULocationID        INTEGER        NOT NULL
+  DOLocationID        INTEGER        NOT NULL
+  payment_type        FLOAT          -- 1=Credit, 2=Cash, 3=No charge,
+                                     -- 4=Dispute, 5=Unknown, 6=Voided
+  fare_amount         FLOAT          NOT NULL  -- must be >= 0
+  extra               FLOAT
+  mta_tax             FLOAT
+  tip_amount          FLOAT
+  tolls_amount        FLOAT
+  improvement_surcharge FLOAT
+  total_amount        FLOAT
+  congestion_surcharge FLOAT
+  airport_fee         FLOAT
+
+Source: TLC Trip Record Data (yellow cab)
+Expected date range: 2023-01 to 2024-12
+Typical batch size: 50k–500k rows
