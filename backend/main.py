@@ -150,6 +150,47 @@ class QuarantineResolveIn(BaseModel):
     column_name:   Optional[str] = None  # which rule to update (if update_rule=True)
 
 
+def _save_org_incident(org_id: str, pipeline_name: str, error: Exception,
+                       fix_policy: dict, label: str, violations: dict) -> None:
+    """
+    Embed the resolved incident and store in org_incidents for Tier 3 lookups.
+    If the same normalized pattern has been seen before in this org, increment
+    resolved_count (more confident fix) rather than creating a duplicate.
+    """
+    from wrapper.embeddings import normalize_error, embed
+    normalized = normalize_error(error)
+    try:
+        embedding = embed(normalized)
+    except Exception as e:
+        log.warning(f"[org_incidents] Embedding failed, skipping: {e}")
+        return
+
+    import hashlib
+    fp = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id, resolved_count FROM org_incidents WHERE org_id = ? AND incident_text = ?",
+            (org_id, normalized),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE org_incidents SET resolved_count = resolved_count + 1 WHERE id = ?",
+                (existing["id"],),
+            )
+            log.info(f"[org_incidents] Updated — seen {existing['resolved_count']+1} times in org")
+        else:
+            conn.execute(
+                """INSERT INTO org_incidents
+                     (org_id, pipeline_name, incident_text, embedding,
+                      fix_policy, label, violations)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (org_id, pipeline_name, normalized, json.dumps(embedding),
+                 json.dumps(fix_policy), label, json.dumps(violations)),
+            )
+            log.info(f"[org_incidents] Saved new incident from pipeline '{pipeline_name}'")
+
+
 def _triage_quarantine(pipeline_name: str, violations: dict, sample_rows: list[dict]) -> dict:
     """
     Run the tiered diagnosis engine against the quarantine batch.
@@ -259,11 +300,23 @@ def resolve_quarantine(batch_id: str, resolution: QuarantineResolveIn):
                 ),
             )
 
-    # Contribute anonymised pattern to cross-org corpus (Tier 4)
     violations_dict = json.loads(row["violations"] or "{}")
     label           = resolution.column_name or next(iter(violations_dict), "fix")
     error_text      = f"Quarantine violations: {violations_dict}"
-    corpus.contribute(ValueError(error_text), resolution.fix_policy, label)
+    synthetic_error = ValueError(error_text)
+
+    # Tier 3: save to org incident history for cross-pipeline lookup
+    _save_org_incident(
+        org_id=ORG_ID,
+        pipeline_name=row["pipeline_name"],
+        error=synthetic_error,
+        fix_policy=resolution.fix_policy,
+        label=label,
+        violations=violations_dict,
+    )
+
+    # Tier 4: contribute anonymised fingerprint to cross-org corpus
+    corpus.contribute(synthetic_error, resolution.fix_policy, label)
 
     return {"status": "resolved", "batch_id": batch_id}
 
@@ -278,6 +331,27 @@ def skip_quarantine(batch_id: str):
 
 
 # ── Corpus ───────────────────────────────────────────────────────────────────
+
+@app.get("/api/org-incidents")
+def list_org_incidents():
+    """Tier 3: resolved incidents across all pipelines in this org."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, org_id, pipeline_name, incident_text, fix_policy,
+                      label, violations, resolved_count, created_at
+               FROM org_incidents
+               WHERE org_id = ?
+               ORDER BY resolved_count DESC, created_at DESC""",
+            (ORG_ID,),
+        ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["fix_policy"] = json.loads(d["fix_policy"])
+        d["violations"] = json.loads(d["violations"] or "{}")
+        result.append(d)
+    return result
+
 
 @app.get("/api/corpus")
 def list_corpus():

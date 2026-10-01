@@ -44,6 +44,22 @@ def init_db() -> None:
                 resolved_at   TEXT
             );
 
+            -- Tier 3: org-wide incident history (resolved quarantine batches with embeddings)
+            -- Searched via embedding similarity across ALL pipelines in the org.
+            -- "Pipeline B gets fixed by knowledge from pipeline A."
+            CREATE TABLE IF NOT EXISTS org_incidents (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                org_id          TEXT NOT NULL,
+                pipeline_name   TEXT NOT NULL,
+                incident_text   TEXT NOT NULL,   -- normalized fingerprint for embedding
+                embedding       TEXT NOT NULL,   -- JSON float array (768-dim nomic-embed-text)
+                fix_policy      TEXT NOT NULL,   -- JSON operation spec actually applied
+                label           TEXT NOT NULL,
+                violations      TEXT,            -- JSON violation summary for display
+                resolved_count  INTEGER NOT NULL DEFAULT 1,
+                created_at      TEXT DEFAULT (datetime('now'))
+            );
+
             -- Tier 4 corpus: anonymized cross-org error patterns + fix policies
             -- Embeddings stored as JSON float arrays (local dev).
             -- Production: swap this table for a pgvector column:

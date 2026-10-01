@@ -91,34 +91,63 @@ Return ONLY a JSON object:
     return None
 
 
-# ── Tier 3: org-wide cross-pipeline lookup ────────────────────────────────────
+# ── Tier 3: org-wide cross-pipeline lookup (embedding similarity) ─────────────
 
 def _tier3(error: Exception, org_id: str) -> dict | None:
+    """
+    Search resolved incidents from ALL pipelines in this org using embedding
+    similarity. This is the "2am on-call" tier: the fix someone applied to
+    pipeline A last month is instantly available to pipeline B tonight.
+    """
     from backend.database import get_conn
-    msg = str(error)
-    # Find rules from ANY pipeline in this org that match this error pattern
+    from wrapper.embeddings import normalize_error, embed, best_match, TIER3_THRESHOLD
+
+    normalized = normalize_error(error)
+    try:
+        query_vec = embed(normalized)
+    except Exception as e:
+        log.warning(f"[tier3] Embedding unavailable: {e}")
+        return None
+
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT * FROM rules WHERE org_id = ? AND fix_policy != '{}'
-               ORDER BY created_at DESC""",
+            """SELECT * FROM org_incidents
+               WHERE org_id = ?
+               ORDER BY resolved_count DESC""",
             (org_id,),
         ).fetchall()
 
     if not rows:
         return None
 
-    msg_lower = msg.lower()
+    candidates = []
     for row in rows:
-        if row["column_name"].lower() in msg_lower:
-            fix = json.loads(row["fix_policy"])
-            log.info(f"[tier3] Org-wide match: column '{row['column_name']}' from pipeline '{row['pipeline_name']}'")
-            return {
-                "operation":    fix,
-                "label":        f"Org rule: {row['rule_type']} on {row['column_name']}",
-                "tier":         3,
-                "auto_fix":     bool(row["auto_fix"]),
-                "source_pipeline": row["pipeline_name"],
-            }
+        try:
+            candidates.append({
+                **dict(row),
+                "embedding": json.loads(row["embedding"]),
+            })
+        except Exception:
+            continue
+
+    match, similarity = best_match(query_vec, candidates, threshold=TIER3_THRESHOLD)
+    if match:
+        fix = json.loads(match["fix_policy"])
+        log.info(
+            f"[tier3] Org match — similarity={similarity:.3f}, "
+            f"pipeline='{match['pipeline_name']}', "
+            f"seen {match['resolved_count']} time(s) in org"
+        )
+        return {
+            "operation":       fix,
+            "label":           match["label"],
+            "analysis":        f"Org knowledge: previously resolved in pipeline '{match['pipeline_name']}' ({match['resolved_count']} time(s))",
+            "tier":            3,
+            "auto_fix":        similarity >= 0.92,   # auto-apply only high-confidence matches
+            "source_pipeline": match["pipeline_name"],
+            "similarity":      round(similarity, 3),
+            "resolved_count":  match["resolved_count"],
+        }
     return None
 
 

@@ -24,7 +24,7 @@ import re
 
 import requests
 
-from wrapper.embeddings import embed, best_match
+from wrapper.embeddings import embed, best_match, normalize_error
 
 log = logging.getLogger("resilience")
 
@@ -33,21 +33,6 @@ CORPUS_KEY = os.getenv("CORPUS_API_KEY", "")
 
 
 # ── Fingerprinting ─────────────────────────────────────────────────────────────
-
-def _normalize(error: Exception) -> str:
-    """
-    Produce a normalized, anonymized text representation of an error
-    suitable for embedding. Strips specific values while keeping structure
-    so errors from different orgs with the same root cause produce
-    similar embeddings.
-    """
-    msg = str(error)
-    msg = re.sub(r"\b\d+(\.\d+)?\b", "<N>", msg)      # numbers
-    msg = re.sub(r"'[^']{1,120}'", "<VAL>", msg)        # single-quoted strings
-    msg = re.sub(r'"[^"]{1,120}"', "<VAL>", msg)        # double-quoted strings
-    msg = re.sub(r"[\\/][^\s,;)]+", "<PATH>", msg)      # file paths
-    msg = re.sub(r"\b[A-Z0-9]{8,}\b", "<ID>", msg)     # UUIDs / long IDs
-    return f"{type(error).__name__}: {msg}"
 
 
 def _hash(normalized: str) -> str:
@@ -179,7 +164,7 @@ def _remote_contribute(normalized: str, fix_policy: dict, label: str,
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def lookup(error: Exception) -> dict | None:
-    normalized = _normalize(error)
+    normalized = normalize_error(error)
     if CORPUS_API:
         return _remote_lookup(normalized)
     return _local_lookup(normalized)
@@ -187,7 +172,7 @@ def lookup(error: Exception) -> dict | None:
 
 def contribute(error: Exception, fix_policy: dict, label: str,
                vertical: str = "financial_services") -> None:
-    normalized  = _normalize(error)
+    normalized  = normalize_error(error)
     fp          = _hash(normalized)
     error_class = type(error).__name__
     if CORPUS_API:
