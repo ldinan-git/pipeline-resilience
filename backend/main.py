@@ -33,6 +33,8 @@ from backend.database import init_db, get_conn
 from backend import store
 from wrapper.rules import ValidationRule, save_rule, delete_rule, load_rules
 from wrapper.learn import learn_from_sample
+from wrapper import corpus
+from wrapper.diagnosis import diagnose, TIER_LABELS
 
 app = FastAPI(title="Pipeline Resilience API")
 
@@ -148,63 +150,47 @@ class QuarantineResolveIn(BaseModel):
     column_name:   Optional[str] = None  # which rule to update (if update_rule=True)
 
 
-MODEL = "llama3.2"
-
-
 def _triage_quarantine(pipeline_name: str, violations: dict, sample_rows: list[dict]) -> dict:
-    """Ask the LLM to suggest fix policies for each violated column."""
-    rules = load_rules(pipeline_name, org_id=ORG_ID)
-    rules_summary = [
-        {"column": r.column_name, "rule_type": r.rule_type, "params": r.params}
-        for r in rules
-    ]
+    """
+    Run the tiered diagnosis engine against the quarantine batch.
+    Returns a triage dict with tier, analysis, and suggestions.
+    """
+    # Synthesize a representative error from the violations summary
+    # so the diagnosis engine can fingerprint and cascade tiers
+    col_names = list(violations.keys())
+    error_msg = f"Quarantine violations in columns: {col_names} — {violations}"
+    synthetic_error = ValueError(error_msg)
 
-    prompt = f"""A data pipeline quarantined {len(sample_rows)} rows due to validation rule failures.
+    result = diagnose(
+        error=synthetic_error,
+        pipeline_name=pipeline_name,
+        org_id=ORG_ID,
+        failing_rows=sample_rows,
+    )
 
-Violated rules:
-{json.dumps(violations, indent=2)}
+    # Normalise into the suggestion format the frontend expects
+    suggestions = result.get("suggestions", [])
+    if not suggestions and result.get("operation"):
+        suggestions = [{
+            "column":      result.get("operation", {}).get("column", col_names[0] if col_names else ""),
+            "label":       result.get("label", "Apply fix"),
+            "description": result.get("analysis", ""),
+            "operation":   result["operation"],
+        }]
 
-Existing rules for this pipeline:
-{json.dumps(rules_summary, indent=2)}
-
-Sample of quarantined rows:
-{json.dumps(sample_rows[:8], indent=2)}
-
-For each violated column, suggest the best fix operation from these options:
-  {{"operation": "filter",    "column": "col", "operator": ">=", "value": 0}}  — remove out-of-range rows
-  {{"operation": "clamp",     "column": "col", "min": 0, "max": null}}         — clip values to range
-  {{"operation": "fillna",    "column": "col", "value": 1}}                    — fill nulls
-  {{"operation": "filter_in", "column": "col", "values": [1,2,3,4,5,6]}}      — remove unknown enum values
-  {{"operation": "map_values","column": "col", "mapping": {{"99": 5}}}}        — remap specific bad values to good ones
-
-Return ONLY a JSON object like:
-{{
-  "analysis": "one sentence describing the overall data quality issue",
-  "suggestions": [
-    {{
-      "column": "column_name",
-      "label": "short action name",
-      "description": "what this does in plain English",
-      "operation": {{ ... }}
-    }}
-  ]
-}}"""
-
-    try:
-        response = ollama.chat(model=MODEL, messages=[{"role": "user", "content": prompt}])
-        content  = response["message"]["content"]
-        match    = re.search(r"\{.*\}", content, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-    except Exception:
-        pass
-    return {"analysis": "Could not generate suggestions.", "suggestions": []}
+    return {
+        "analysis":   result.get("analysis", ""),
+        "suggestions": suggestions,
+        "tier":        result.get("tier", 5),
+        "tier_label":  result.get("tier_label", TIER_LABELS[5]),
+        "auto_fix":    result.get("auto_fix", False),
+    }
 
 
 @app.post("/api/quarantine")
 def receive_quarantine(batch: QuarantineIn):
-    batch_id  = str(uuid4())
-    triage    = _triage_quarantine(batch.pipeline_name, batch.violations, batch.sample_rows)
+    batch_id = str(uuid4())
+    triage   = _triage_quarantine(batch.pipeline_name, batch.violations, batch.sample_rows)
     with get_conn() as conn:
         conn.execute(
             """
@@ -272,6 +258,11 @@ def resolve_quarantine(batch_id: str, resolution: QuarantineResolveIn):
                     row["pipeline_name"], resolution.column_name, ORG_ID,
                 ),
             )
+
+    # Contribute anonymised pattern to cross-org corpus (Tier 4)
+    label = resolution.column_name or "fix"
+    synthetic_error = ValueError(json.loads(row["violations"] or "{}"))
+    corpus.contribute(synthetic_error, resolution.fix_policy, label)
 
     return {"status": "resolved", "batch_id": batch_id}
 

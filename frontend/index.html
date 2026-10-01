@@ -135,8 +135,29 @@
           </template>
         </div>
 
+        <!-- Tier badge — this is the network effect made visible -->
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px;" x-show="batch.fix_summary?.tier">
+          <span style="font-size:11px; color:#64748b;">Diagnosed by</span>
+          <span class="pill"
+            :class="{
+              'green':  batch.fix_summary?.tier <= 2,
+              'blue':   batch.fix_summary?.tier === 3,
+              'yellow': batch.fix_summary?.tier === 4,
+              'gray':   batch.fix_summary?.tier === 5
+            }"
+            x-text="'Tier ' + batch.fix_summary?.tier + ': ' + batch.fix_summary?.tier_label">
+          </span>
+          <span x-show="batch.fix_summary?.tier === 4" style="font-size:11px; color:#fbbf24;">
+            — another org already solved this
+          </span>
+          <span x-show="batch.fix_summary?.auto_fix && batch.fix_summary?.tier <= 3"
+            style="font-size:11px; color:#4ade80;">
+            — can auto-apply
+          </span>
+        </div>
+
         <div class="analysis-box" x-show="batch.fix_summary?.analysis">
-          AI analysis: <span x-text="batch.fix_summary?.analysis"></span>
+          <span x-text="batch.fix_summary?.analysis"></span>
         </div>
 
         <template x-for="s in (batch.fix_summary?.suggestions || [])" :key="s.column">
