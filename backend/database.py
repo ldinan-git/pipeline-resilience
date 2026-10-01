@@ -44,6 +44,26 @@ def init_db() -> None:
                 resolved_at   TEXT
             );
 
+            -- Tier 4 corpus: anonymized cross-org error patterns + fix policies
+            -- Embeddings stored as JSON float arrays (local dev).
+            -- Production: swap this table for a pgvector column:
+            --   ALTER TABLE corpus_entries ADD COLUMN embedding vector(768);
+            --   CREATE INDEX ON corpus_entries USING ivfflat (embedding vector_cosine_ops);
+            CREATE TABLE IF NOT EXISTS corpus_entries (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint      TEXT NOT NULL UNIQUE,
+                fingerprint_text TEXT NOT NULL,
+                embedding        TEXT NOT NULL,
+                fix_policy       TEXT NOT NULL,
+                label            TEXT NOT NULL,
+                vertical         TEXT NOT NULL DEFAULT 'general',
+                error_class      TEXT,
+                applied_count    INTEGER NOT NULL DEFAULT 1,
+                confidence       REAL NOT NULL DEFAULT 1.0,
+                created_at       TEXT DEFAULT (datetime('now')),
+                updated_at       TEXT DEFAULT (datetime('now'))
+            );
+
             -- Legacy: kept for backwards compat, no longer the primary flow
             CREATE TABLE IF NOT EXISTS resolutions (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,

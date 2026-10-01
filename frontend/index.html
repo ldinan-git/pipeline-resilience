@@ -87,6 +87,10 @@
   <div class="tab" :class="{active: tab==='learn'}" @click="tab='learn'">
     Learn from Data
   </div>
+  <div class="tab" :class="{active: tab==='corpus'}" @click="tab='corpus'; loadCorpus()">
+    Corpus
+    <span class="badge" style="background:#7c3aed" x-show="corpusEntries.length > 0" x-text="corpusEntries.length"></span>
+  </div>
 </div>
 
 <div class="content">
@@ -246,6 +250,65 @@
     </template>
   </div>
 
+  <!-- Corpus Tab -->
+  <div x-show="tab === 'corpus'">
+    <div style="margin-bottom:16px;">
+      <div style="font-size:13px; color:#64748b; line-height:1.7;">
+        <strong style="color:#a78bfa;">Tier 4 Cross-Org Corpus</strong> — anonymized error patterns and the fixes that resolved them.
+        Every resolved quarantine batch contributes here. In production this is centrally hosted and shared across all customers.
+        No raw data, no org identity — only the structural error pattern and the operation that fixed it.
+      </div>
+    </div>
+
+    <div class="empty" x-show="corpusEntries.length === 0">
+      Corpus is empty. Resolve a quarantine batch to add the first entry.
+    </div>
+
+    <div class="card" x-show="corpusEntries.length > 0">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+        <h2 x-text="corpusEntries.length + ' patterns stored'"></h2>
+        <div style="font-size:12px; color:#64748b;">
+          Similarity threshold: 0.82 — errors above this match automatically
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Normalized pattern</th>
+            <th>Fix operation</th>
+            <th>Label</th>
+            <th>Vertical</th>
+            <th>Times seen</th>
+            <th>Added</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="entry in corpusEntries" :key="entry.id">
+            <tr>
+              <td style="font-family:monospace; font-size:11px; color:#94a3b8; max-width:300px; word-break:break-word;" x-text="entry.fingerprint_text"></td>
+              <td style="font-family:monospace; font-size:11px; color:#7dd3fc;" x-text="entry.fix_policy?.operation"></td>
+              <td style="font-size:12px;" x-text="entry.label"></td>
+              <td><span class="pill blue" x-text="entry.vertical"></span></td>
+              <td style="font-weight:600; color:#a78bfa;" x-text="entry.applied_count"></td>
+              <td style="font-size:11px; color:#475569;" x-text="entry.created_at?.slice(0,10)"></td>
+              <td><button class="btn danger sm" @click="deleteCorpusEntry(entry)">Delete</button></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card" style="border-color:#4c1d95;">
+      <h2 style="color:#a78bfa;">Production path</h2>
+      <div style="font-size:13px; color:#94a3b8; line-height:1.8;">
+        <div>Currently running locally — the corpus is in your SQLite database, similarity computed in Python.</div>
+        <div style="margin-top:8px;">In production, set <code style="color:#7dd3fc;">CORPUS_API_URL</code> to point at the central hosted corpus. The same <code>lookup()</code> and <code>contribute()</code> calls work unchanged — they just route to the remote API instead of local SQLite.</div>
+        <div style="margin-top:8px;">The hosted corpus uses <strong>pgvector</strong> for efficient similarity search across millions of entries, filtered by industry vertical so financial services firms match against financial services patterns first.</div>
+      </div>
+    </div>
+  </div>
+
   <!-- Learn Tab -->
   <div x-show="tab === 'learn'">
     <div class="card">
@@ -301,6 +364,7 @@ function app() {
     tab: 'quarantine',
     batches: [],
     rules: [],
+    corpusEntries: [],
     backendOk: false,
     learnForm: { pipeline: 'nyc-taxi', csv_path: 'data/nyc_taxi_good_sample.csv' },
     learnLoading: false,
@@ -358,6 +422,19 @@ function app() {
         body: JSON.stringify({auto_fix: value}),
       });
       rule.auto_fix = value;
+    },
+
+    async loadCorpus() {
+      try {
+        const r = await fetch('/api/corpus');
+        if (r.ok) this.corpusEntries = await r.json();
+      } catch {}
+    },
+
+    async deleteCorpusEntry(entry) {
+      if (!confirm(`Remove this corpus entry?`)) return;
+      await fetch(`/api/corpus/${entry.id}`, {method:'DELETE'});
+      this.corpusEntries = this.corpusEntries.filter(e => e.id !== entry.id);
     },
 
     async deleteRule(rule) {

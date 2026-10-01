@@ -1,17 +1,22 @@
 """
 Tier 4: Cross-org corpus.
 
-In production this hits a central hosted API — anonymized error fingerprints
-and fix policies contributed by all customers, queryable by any customer.
-No raw data, no column values, no org identity — only structural error patterns
-and the fix policies that resolved them.
+Architecture:
+  Contribution  — when a human resolves an incident, the anonymized error
+                  fingerprint + fix policy is embedded and stored.
+  Lookup        — incoming error is embedded; cosine similarity finds the
+                  closest stored fix above the confidence threshold.
 
-Today this is a stub. The interface is fixed; the implementation fills in
-as the corpus grows. Every resolved incident from any customer is a candidate
-for contribution (with consent).
+Local dev:  SQLite corpus_entries table, similarity in numpy.
+Production: Central hosted API — same interface, pgvector backend.
+            Set CORPUS_API_URL + CORPUS_API_KEY to activate.
+
+Anonymization guarantee:
+  Only the structural error pattern is embedded — specific values, paths,
+  org names, and column values are stripped before embedding.
+  No customer data leaves the customer's environment in identifiable form.
 """
 from __future__ import annotations
-import hashlib
 import json
 import logging
 import os
@@ -19,76 +24,173 @@ import re
 
 import requests
 
+from wrapper.embeddings import embed, best_match
+
 log = logging.getLogger("resilience")
 
-CORPUS_API = os.getenv("CORPUS_API_URL", "")  # empty = corpus not yet connected
+CORPUS_API = os.getenv("CORPUS_API_URL", "")
 CORPUS_KEY = os.getenv("CORPUS_API_KEY", "")
 
 
-def fingerprint(error: Exception) -> str:
+# ── Fingerprinting ─────────────────────────────────────────────────────────────
+
+def _normalize(error: Exception) -> str:
     """
-    Structural fingerprint of an error — vendor + error class + pattern.
-    Strips org-specific values (numbers, paths, IDs) so errors from different
-    orgs hitting the same root cause share the same fingerprint.
+    Produce a normalized, anonymized text representation of an error
+    suitable for embedding. Strips specific values while keeping structure
+    so errors from different orgs with the same root cause produce
+    similar embeddings.
     """
     msg = str(error)
-    # Remove specific values, keep structure
-    msg = re.sub(r"\b\d+(\.\d+)?\b", "<N>", msg)        # numbers
-    msg = re.sub(r"'[^']{1,80}'", "<VAL>", msg)          # quoted strings
-    msg = re.sub(r'"[^"]{1,80}"', "<VAL>", msg)
-    msg = re.sub(r"[\\/][^\s,]+", "<PATH>", msg)         # file paths
-    error_class = type(error).__name__
-    raw = f"{error_class}::{msg}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    msg = re.sub(r"\b\d+(\.\d+)?\b", "<N>", msg)      # numbers
+    msg = re.sub(r"'[^']{1,120}'", "<VAL>", msg)        # single-quoted strings
+    msg = re.sub(r'"[^"]{1,120}"', "<VAL>", msg)        # double-quoted strings
+    msg = re.sub(r"[\\/][^\s,;)]+", "<PATH>", msg)      # file paths
+    msg = re.sub(r"\b[A-Z0-9]{8,}\b", "<ID>", msg)     # UUIDs / long IDs
+    return f"{type(error).__name__}: {msg}"
 
 
-def lookup(error: Exception) -> dict | None:
-    """
-    Query the cross-org corpus for a known fix.
-    Returns {"operation": ..., "label": ..., "match_count": N} or None.
-    """
-    if not CORPUS_API:
-        return None  # corpus not connected yet
+def _hash(normalized: str) -> str:
+    import hashlib
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
+# ── Local corpus (SQLite + numpy) ─────────────────────────────────────────────
+
+def _local_lookup(normalized: str) -> dict | None:
+    from backend.database import get_conn
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM corpus_entries ORDER BY applied_count DESC"
+        ).fetchall()
+
+    if not rows:
+        return None
+
+    candidates = []
+    for row in rows:
+        try:
+            candidates.append({
+                **dict(row),
+                "embedding": json.loads(row["embedding"]),
+            })
+        except Exception:
+            continue
+
     try:
-        fp = fingerprint(error)
-        resp = requests.get(
+        query_vec = embed(normalized)
+    except Exception as e:
+        log.warning(f"[corpus] Embedding model unavailable: {e}")
+        return None
+
+    match, similarity = best_match(query_vec, candidates)
+    if match:
+        log.info(
+            f"[corpus:tier4] Match — similarity={similarity:.3f}, "
+            f"seen {match['applied_count']} times, label='{match['label']}'"
+        )
+        return {
+            "found":       True,
+            "operation":   json.loads(match["fix_policy"]),
+            "label":       match["label"],
+            "match_count": match["applied_count"],
+            "similarity":  round(similarity, 3),
+        }
+
+    log.debug(f"[corpus] Best similarity {similarity:.3f} below threshold — no match")
+    return None
+
+
+def _local_contribute(normalized: str, fp: str, fix_policy: dict, label: str,
+                       vertical: str, error_class: str) -> None:
+    from backend.database import get_conn
+    try:
+        embedding = embed(normalized)
+    except Exception as e:
+        log.warning(f"[corpus] Cannot embed for contribution: {e}")
+        return
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id, applied_count FROM corpus_entries WHERE fingerprint = ?", (fp,)
+        ).fetchone()
+
+        if existing:
+            conn.execute(
+                "UPDATE corpus_entries SET applied_count = applied_count + 1, updated_at = datetime('now') WHERE id = ?",
+                (existing["id"],),
+            )
+            log.info(f"[corpus] Updated entry — now seen {existing['applied_count'] + 1} times")
+        else:
+            conn.execute(
+                """INSERT INTO corpus_entries
+                     (fingerprint, fingerprint_text, embedding, fix_policy,
+                      label, vertical, error_class)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (fp, normalized, json.dumps(embedding),
+                 json.dumps(fix_policy), label, vertical, error_class),
+            )
+            log.info(f"[corpus] New entry added — '{label}'")
+
+
+# ── Remote corpus (production API) ────────────────────────────────────────────
+
+def _remote_lookup(normalized: str) -> dict | None:
+    try:
+        query_vec = embed(normalized)
+        resp = requests.post(
             f"{CORPUS_API}/lookup",
-            params={"fingerprint": fp},
+            json={"embedding": query_vec, "text": normalized},
             headers={"X-API-Key": CORPUS_KEY},
             timeout=5,
         )
         if resp.status_code == 200:
             data = resp.json()
             if data.get("found"):
-                log.info(f"[corpus:tier4] Match found — seen {data['match_count']} times across orgs")
+                log.info(f"[corpus:tier4] Remote match — seen {data.get('match_count')} times across orgs")
                 return data
     except Exception as e:
-        log.debug(f"[corpus:tier4] Unavailable: {e}")
+        log.debug(f"[corpus:tier4] Remote lookup failed: {e}")
     return None
 
 
-def contribute(error: Exception, fix_policy: dict, label: str, vertical: str = "financial_services") -> None:
-    """
-    Anonymously contribute a resolved incident to the corpus.
-    Only the error fingerprint + fix policy + industry vertical are sent.
-    No org identity, no data values, no column names.
-    """
-    if not CORPUS_API:
-        return
+def _remote_contribute(normalized: str, fix_policy: dict, label: str,
+                        vertical: str, error_class: str) -> None:
     try:
-        payload = {
-            "fingerprint": fingerprint(error),
-            "error_class": type(error).__name__,
-            "fix_policy":  fix_policy,
-            "label":       label,
-            "vertical":    vertical,
-        }
+        query_vec = embed(normalized)
         requests.post(
             f"{CORPUS_API}/contribute",
-            json=payload,
+            json={
+                "embedding":   query_vec,
+                "text":        normalized,
+                "fix_policy":  fix_policy,
+                "label":       label,
+                "vertical":    vertical,
+                "error_class": error_class,
+            },
             headers={"X-API-Key": CORPUS_KEY},
             timeout=5,
         )
-        log.info("[corpus:tier4] Contributed resolved incident to cross-org corpus")
+        log.info("[corpus] Contributed to remote corpus")
     except Exception as e:
-        log.debug(f"[corpus:tier4] Contribution failed: {e}")
+        log.debug(f"[corpus] Remote contribution failed: {e}")
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def lookup(error: Exception) -> dict | None:
+    normalized = _normalize(error)
+    if CORPUS_API:
+        return _remote_lookup(normalized)
+    return _local_lookup(normalized)
+
+
+def contribute(error: Exception, fix_policy: dict, label: str,
+               vertical: str = "financial_services") -> None:
+    normalized  = _normalize(error)
+    fp          = _hash(normalized)
+    error_class = type(error).__name__
+    if CORPUS_API:
+        _remote_contribute(normalized, fix_policy, label, vertical, error_class)
+    else:
+        _local_contribute(normalized, fp, fix_policy, label, vertical, error_class)

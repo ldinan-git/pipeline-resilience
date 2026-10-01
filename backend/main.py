@@ -260,9 +260,10 @@ def resolve_quarantine(batch_id: str, resolution: QuarantineResolveIn):
             )
 
     # Contribute anonymised pattern to cross-org corpus (Tier 4)
-    label = resolution.column_name or "fix"
-    synthetic_error = ValueError(json.loads(row["violations"] or "{}"))
-    corpus.contribute(synthetic_error, resolution.fix_policy, label)
+    violations_dict = json.loads(row["violations"] or "{}")
+    label           = resolution.column_name or next(iter(violations_dict), "fix")
+    error_text      = f"Quarantine violations: {violations_dict}"
+    corpus.contribute(ValueError(error_text), resolution.fix_policy, label)
 
     return {"status": "resolved", "batch_id": batch_id}
 
@@ -274,6 +275,33 @@ def skip_quarantine(batch_id: str):
             "UPDATE quarantine_batches SET status='skipped' WHERE id=?", (batch_id,)
         )
     return {"status": "skipped", "batch_id": batch_id}
+
+
+# ── Corpus ───────────────────────────────────────────────────────────────────
+
+@app.get("/api/corpus")
+def list_corpus():
+    """Inspect what's in the Tier 4 cross-org corpus."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, fingerprint, fingerprint_text, fix_policy, label,
+                      vertical, error_class, applied_count, confidence, created_at
+               FROM corpus_entries
+               ORDER BY applied_count DESC"""
+        ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["fix_policy"] = json.loads(d["fix_policy"])
+        result.append(d)
+    return result
+
+
+@app.delete("/api/corpus/{entry_id}")
+def delete_corpus_entry(entry_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM corpus_entries WHERE id = ?", (entry_id,))
+    return {"deleted": entry_id}
 
 
 # ── Legacy event endpoints (kept for compatibility) ───────────────────────────
