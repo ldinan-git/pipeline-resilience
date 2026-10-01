@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pipeline Resilience</title>
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js" defer></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+  .header { background: #1e293b; border-bottom: 1px solid #334155; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+  .header h1 { font-size: 18px; font-weight: 600; color: #f1f5f9; }
+  .header .subtitle { font-size: 13px; color: #64748b; }
+  .tabs { display: flex; gap: 2px; padding: 16px 24px 0; border-bottom: 1px solid #1e293b; }
+  .tab { padding: 10px 18px; cursor: pointer; font-size: 14px; color: #64748b; border-bottom: 2px solid transparent; transition: all .15s; }
+  .tab.active { color: #60a5fa; border-bottom-color: #60a5fa; }
+  .tab .badge { background: #ef4444; color: white; font-size: 11px; border-radius: 9px; padding: 1px 6px; margin-left: 6px; }
+  .content { padding: 24px; max-width: 1100px; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+  .card h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; color: #f1f5f9; }
+  .pill { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; padding: 3px 10px; border-radius: 20px; font-weight: 500; }
+  .pill.green  { background: #14532d; color: #86efac; }
+  .pill.yellow { background: #713f12; color: #fde68a; }
+  .pill.red    { background: #7f1d1d; color: #fca5a5; }
+  .pill.blue   { background: #1e3a5f; color: #93c5fd; }
+  .pill.gray   { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+  .stat-row { display: flex; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+  .stat { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 14px 18px; min-width: 140px; }
+  .stat .value { font-size: 28px; font-weight: 700; color: #60a5fa; }
+  .stat .label { font-size: 12px; color: #64748b; margin-top: 2px; }
+  .stat.green .value { color: #4ade80; }
+  .stat.yellow .value { color: #fbbf24; }
+  .stat.red .value { color: #f87171; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: #64748b; font-weight: 500; padding: 8px 12px; border-bottom: 1px solid #334155; }
+  td { padding: 10px 12px; border-bottom: 1px solid #1e293b; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #0f172a22; }
+  .btn { padding: 7px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; border: none; font-weight: 500; transition: opacity .15s; }
+  .btn:hover { opacity: .85; }
+  .btn.primary { background: #2563eb; color: white; }
+  .btn.danger  { background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
+  .btn.ghost   { background: transparent; color: #60a5fa; border: 1px solid #334155; }
+  .btn.success { background: #14532d; color: #86efac; border: 1px solid #16a34a; }
+  .btn.sm { padding: 4px 10px; font-size: 12px; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .analysis-box { background: #1c1f2e; border-left: 3px solid #3b82f6; padding: 12px 16px; border-radius: 4px; font-size: 13px; color: #93c5fd; margin-bottom: 14px; }
+  .violation-chip { display: inline-flex; align-items: center; gap: 4px; background: #292524; border: 1px solid #44403c; border-radius: 6px; padding: 4px 10px; font-size: 12px; margin: 3px; }
+  .row-sample { background: #0a0f1e; border: 1px solid #1e293b; border-radius: 6px; padding: 12px; font-family: monospace; font-size: 12px; overflow-x: auto; color: #94a3b8; max-height: 200px; overflow-y: auto; margin-top: 8px; }
+  .suggestion-card { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
+  .suggestion-card h4 { font-size: 13px; font-weight: 600; color: #f1f5f9; margin-bottom: 4px; }
+  .suggestion-card p { font-size: 12px; color: #94a3b8; margin-bottom: 10px; }
+  .op-preview { font-family: monospace; font-size: 11px; background: #0a0f1e; padding: 8px 10px; border-radius: 4px; color: #7dd3fc; margin-bottom: 10px; }
+  .toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+  .toggle input[type=checkbox] { width: 16px; height: 16px; accent-color: #2563eb; cursor: pointer; }
+  input[type=text], textarea { background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; padding: 8px 12px; font-size: 13px; width: 100%; }
+  input[type=text]:focus, textarea:focus { outline: none; border-color: #3b82f6; }
+  .empty { text-align: center; color: #475569; padding: 48px; font-size: 14px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot.green  { background: #22c55e; }
+  .dot.yellow { background: #eab308; }
+  .dot.gray   { background: #64748b; }
+</style>
+</head>
+<body x-data="app()" x-init="init()">
+
+<div class="header">
+  <div>
+    <h1>Pipeline Resilience</h1>
+    <div class="subtitle">Pipeline always runs on clean data — bad rows quarantined for AI triage</div>
+  </div>
+  <div style="margin-left:auto; display:flex; gap:8px; align-items:center;">
+    <span class="dot" :class="backendOk ? 'green' : 'gray'"></span>
+    <span style="font-size:12px; color:#64748b" x-text="backendOk ? 'Backend connected' : 'Backend offline'"></span>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab" :class="{active: tab==='quarantine'}" @click="tab='quarantine'">
+    Quarantine
+    <span class="badge" x-show="pendingCount > 0" x-text="pendingCount"></span>
+  </div>
+  <div class="tab" :class="{active: tab==='rules'}" @click="tab='rules'; loadRules()">
+    Validation Rules
+    <span class="badge" style="background:#1e40af" x-show="rules.length > 0" x-text="rules.length"></span>
+  </div>
+  <div class="tab" :class="{active: tab==='learn'}" @click="tab='learn'">
+    Learn from Data
+  </div>
+</div>
+
+<div class="content">
+
+  <!-- Quarantine Tab -->
+  <div x-show="tab === 'quarantine'">
+    <div class="stat-row" x-show="batches.length > 0">
+      <div class="stat yellow">
+        <div class="value" x-text="totalQuarantined.toLocaleString()"></div>
+        <div class="label">Rows quarantined</div>
+      </div>
+      <div class="stat">
+        <div class="value" x-text="autoFixedBatches"></div>
+        <div class="label">Batches auto-fixed</div>
+      </div>
+      <div class="stat red">
+        <div class="value" x-text="pendingCount"></div>
+        <div class="label">Awaiting review</div>
+      </div>
+    </div>
+
+    <div class="empty" x-show="batches.length === 0">
+      No quarantine batches yet.<br>
+      <span style="font-size:12px; color:#334155; margin-top:8px; display:block">
+        Run your pipeline — rows that fail validation will appear here for AI triage.
+      </span>
+    </div>
+
+    <template x-for="batch in batches" :key="batch.id">
+      <div class="card">
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+          <span class="pill" :class="batch.status === 'pending' ? 'yellow' : batch.status === 'resolved' ? 'green' : 'gray'"
+                x-text="batch.status"></span>
+          <span style="font-size:13px; font-weight:600" x-text="batch.pipeline_name"></span>
+          <span style="font-size:12px; color:#64748b" x-text="batch.row_count + ' rows'"></span>
+          <span style="margin-left:auto; font-size:11px; color:#475569" x-text="batch.created_at?.slice(0,16).replace('T',' ')"></span>
+        </div>
+
+        <div style="margin-bottom:12px;">
+          <span style="font-size:12px; color:#64748b; margin-right:6px;">Violations:</span>
+          <template x-for="(info, col) in batch.violations" :key="col">
+            <span class="violation-chip">
+              <span x-text="col"></span>
+              <span style="color:#94a3b8" x-text="'(' + info.rule_type + ', ' + info.count + ' rows' + (info.auto_fixed ? ' — auto-fixed' : '') + ')'"></span>
+            </span>
+          </template>
+        </div>
+
+        <div class="analysis-box" x-show="batch.fix_summary?.analysis">
+          AI analysis: <span x-text="batch.fix_summary?.analysis"></span>
+        </div>
+
+        <template x-for="s in (batch.fix_summary?.suggestions || [])" :key="s.column">
+          <div class="suggestion-card">
+            <h4 x-text="s.label + ' — ' + s.column"></h4>
+            <p x-text="s.description"></p>
+            <div class="op-preview" x-text="JSON.stringify(s.operation, null, 2)"></div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;" x-show="batch.status === 'pending'">
+              <button class="btn success sm" @click="resolveWithSuggestion(batch, s, false)">
+                Apply once
+              </button>
+              <button class="btn primary sm" @click="resolveWithSuggestion(batch, s, true)">
+                Apply &amp; update rule permanently
+              </button>
+            </div>
+          </div>
+        </template>
+
+        <div style="margin-top:12px;">
+          <button class="btn ghost sm" @click="batch._showRows = !batch._showRows" x-text="(batch._showRows ? 'Hide' : 'Show') + ' sample rows'"></button>
+          <div class="row-sample" x-show="batch._showRows">
+            <template x-for="(row, i) in (batch.sample_rows || []).slice(0, 10)" :key="i">
+              <div x-text="JSON.stringify(row)"></div>
+            </template>
+          </div>
+        </div>
+
+        <div style="display:flex; gap:8px; margin-top:14px;" x-show="batch.status === 'pending'">
+          <button class="btn danger sm" @click="skipBatch(batch)">Skip this batch</button>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- Rules Tab -->
+  <div x-show="tab === 'rules'">
+    <div style="margin-bottom:16px; font-size:13px; color:#64748b;">
+      Rules generated from known-good data. Applied automatically before every pipeline run.
+    </div>
+
+    <div class="empty" x-show="rules.length === 0">
+      No rules yet. Go to <strong>Learn from Data</strong> to generate rules from a clean sample.
+    </div>
+
+    <template x-for="(pipelineRules, pipeline) in groupedRules()" :key="pipeline">
+      <div class="card">
+        <h2 x-text="'Pipeline: ' + pipeline"></h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Column</th>
+              <th>Rule type</th>
+              <th>Valid values / range</th>
+              <th>Fix operation</th>
+              <th>Auto-fix</th>
+              <th>Confidence</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="rule in pipelineRules" :key="rule.id">
+              <tr>
+                <td style="font-weight:600; font-family:monospace; font-size:13px;" x-text="rule.column_name"></td>
+                <td><span class="pill blue" x-text="rule.rule_type"></span></td>
+                <td style="font-family:monospace; font-size:12px; color:#94a3b8;" x-text="ruleParamSummary(rule)"></td>
+                <td style="font-family:monospace; font-size:11px; color:#7dd3fc;" x-text="rule.fix_policy?.operation || '—'"></td>
+                <td>
+                  <label class="toggle">
+                    <input type="checkbox" :checked="rule.auto_fix"
+                      @change="toggleAutoFix(rule, $event.target.checked)">
+                    <span x-text="rule.auto_fix ? 'On' : 'Off'"></span>
+                  </label>
+                </td>
+                <td>
+                  <span class="pill" :class="rule.confidence === 'high' ? 'green' : rule.confidence === 'medium' ? 'yellow' : 'red'"
+                    x-text="rule.confidence"></span>
+                </td>
+                <td>
+                  <button class="btn danger sm" @click="deleteRule(rule)">Delete</button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </template>
+  </div>
+
+  <!-- Learn Tab -->
+  <div x-show="tab === 'learn'">
+    <div class="card">
+      <h2>Learn Validation Rules from Known-Good Data</h2>
+      <p style="font-size:13px; color:#64748b; margin-bottom:16px; line-height:1.6;">
+        Provide a sample of correct, verified output data. The LLM analyzes column statistics —
+        valid ranges, valid enum values, null rates — and generates validation rules with fix policies.
+        These rules run before every pipeline execution, so the pipeline only ever sees clean data.
+      </p>
+
+      <div style="margin-bottom:12px;">
+        <label style="font-size:13px; color:#94a3b8; display:block; margin-bottom:6px;">Pipeline name</label>
+        <input type="text" x-model="learnForm.pipeline" placeholder="nyc-taxi" style="max-width:300px;">
+      </div>
+      <div style="margin-bottom:16px;">
+        <label style="font-size:13px; color:#94a3b8; display:block; margin-bottom:6px;">Path to known-good CSV (on the server)</label>
+        <input type="text" x-model="learnForm.csv_path" placeholder="data/nyc_taxi_good_sample.csv" style="max-width:500px;">
+        <div style="font-size:12px; color:#475569; margin-top:4px;">
+          First run: <code style="color:#7dd3fc;">python generate_good_sample.py</code> to create a clean reference dataset.
+        </div>
+      </div>
+
+      <button class="btn primary" @click="runLearn()" :disabled="learnLoading">
+        <span x-show="!learnLoading">Generate rules from this data</span>
+        <span x-show="learnLoading">LLM analyzing data...</span>
+      </button>
+
+      <div x-show="learnResult" style="margin-top:16px; padding:12px 16px; background:#0f172a; border-radius:8px; border-left:3px solid #22c55e;">
+        <div style="color:#4ade80; font-weight:600;" x-text="learnResult?.message"></div>
+        <div style="font-size:12px; color:#64748b; margin-top:4px;">Switch to <strong>Validation Rules</strong> to review.</div>
+      </div>
+      <div x-show="learnError" style="margin-top:16px; padding:12px 16px; background:#0f172a; border-radius:8px; border-left:3px solid #ef4444;">
+        <div style="color:#f87171;" x-text="learnError"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>How it works</h2>
+      <div style="font-size:13px; color:#94a3b8; line-height:1.9;">
+        <div><span style="color:#60a5fa; font-weight:600;">1. Learn</span> — Provide known-good output data. LLM reads column statistics and generates rules (valid ranges, valid enum codes, required fields) plus a default fix policy for each.</div>
+        <div><span style="color:#60a5fa; font-weight:600;">2. Validate</span> — On every pipeline run, raw data is checked against these rules before the pipeline sees it.</div>
+        <div><span style="color:#60a5fa; font-weight:600;">3. Auto-fix &amp; quarantine</span> — Rows with known violations are auto-fixed in place. Rows with unknown violations are split into a quarantine batch. The pipeline runs immediately on the clean portion.</div>
+        <div><span style="color:#60a5fa; font-weight:600;">4. Triage</span> — The LLM analyzes quarantined rows and suggests fix policies. Accepted fixes update the rule permanently, so future occurrences are handled automatically without human review.</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+function app() {
+  return {
+    tab: 'quarantine',
+    batches: [],
+    rules: [],
+    backendOk: false,
+    learnForm: { pipeline: 'nyc-taxi', csv_path: 'data/nyc_taxi_good_sample.csv' },
+    learnLoading: false,
+    learnResult: null,
+    learnError: null,
+
+    get pendingCount()      { return this.batches.filter(b => b.status === 'pending').length; },
+    get totalQuarantined()  { return this.batches.reduce((s, b) => s + b.row_count, 0); },
+    get autoFixedBatches()  { return this.batches.filter(b => Object.values(b.violations||{}).some(v => v.auto_fixed)).length; },
+
+    async init() {
+      await this.loadBatches();
+      setInterval(() => this.loadBatches(), 6000);
+    },
+
+    async loadBatches() {
+      try {
+        const r = await fetch('/api/quarantine');
+        if (r.ok) { this.batches = await r.json(); this.backendOk = true; }
+      } catch { this.backendOk = false; }
+    },
+
+    async loadRules() {
+      try {
+        const r = await fetch('/api/rules');
+        if (r.ok) this.rules = await r.json();
+      } catch {}
+    },
+
+    groupedRules() {
+      const g = {};
+      for (const rule of this.rules) {
+        if (!g[rule.pipeline_name]) g[rule.pipeline_name] = [];
+        g[rule.pipeline_name].push(rule);
+      }
+      return g;
+    },
+
+    ruleParamSummary(rule) {
+      if (rule.rule_type === 'range') {
+        const p = rule.params;
+        return `${p.min ?? '—'} to ${p.max ?? '—'}`;
+      }
+      if (rule.rule_type === 'enum') {
+        const v = rule.params.values || [];
+        return v.slice(0, 8).join(', ') + (v.length > 8 ? '…' : '');
+      }
+      return 'required';
+    },
+
+    async toggleAutoFix(rule, value) {
+      await fetch(`/api/rules/${rule.id}`, {
+        method: 'PUT',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({auto_fix: value}),
+      });
+      rule.auto_fix = value;
+    },
+
+    async deleteRule(rule) {
+      if (!confirm(`Delete rule for ${rule.column_name}?`)) return;
+      await fetch(`/api/rules/${rule.id}`, {method:'DELETE'});
+      this.rules = this.rules.filter(r => r.id !== rule.id);
+    },
+
+    async resolveWithSuggestion(batch, suggestion, updateRule) {
+      await fetch(`/api/quarantine/${batch.id}/resolve`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          fix_policy:  suggestion.operation,
+          update_rule: updateRule,
+          column_name: suggestion.column,
+        }),
+      });
+      batch.status = 'resolved';
+    },
+
+    async skipBatch(batch) {
+      await fetch(`/api/quarantine/${batch.id}/skip`, {method:'POST'});
+      batch.status = 'skipped';
+    },
+
+    async runLearn() {
+      this.learnLoading = true;
+      this.learnResult = null;
+      this.learnError = null;
+      try {
+        const r = await fetch('/api/learn', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ pipeline_name: this.learnForm.pipeline, csv_path: this.learnForm.csv_path }),
+        });
+        if (!r.ok) {
+          const e = await r.json();
+          this.learnError = e.detail || 'Error';
+        } else {
+          const d = await r.json();
+          this.learnResult = { message: `Generated ${d.rules_generated} rules for '${d.pipeline}'.` };
+          await this.loadRules();
+        }
+      } catch(e) { this.learnError = e.message; }
+      finally { this.learnLoading = false; }
+    },
+  };
+}
+</script>
+</body>
+</html>

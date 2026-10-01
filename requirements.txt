@@ -5,3 +5,6 @@ ollama
 pgvector
 great-expectations
 python-dotenv
+fastapi
+uvicorn[standard]
+requests

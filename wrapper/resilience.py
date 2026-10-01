@@ -1,17 +1,29 @@
 """
-Pipeline resilience wrapper.
-Catches failures, loads plain-text context, calls Ollama for a fix suggestion.
+Pipeline resilience wrapper — quarantine model.
+
+Flow:
+  1. Load raw data from CSV
+  2. Validate against learned rules → split into clean + quarantine
+  3. Auto-fix rows where rules carry a fix_policy (applied by validator)
+  4. Run pipeline immediately on clean data — no retries, no crashes
+  5. Submit quarantined rows asynchronously for AI triage + human review
+  6. If no rules exist yet, warn and run pipeline on all data (unsafe mode)
 """
 
 import functools
+import json
 import logging
-import traceback
+import os
 from pathlib import Path
 
-import ollama
+import pandas as pd
+import requests
 
-CONTEXT_ROOT = Path(__file__).parent.parent / "pipeline-context"
-MODEL = "llama3.2"
+from wrapper.rules import load_rules
+from wrapper.validator import validate_and_split
+
+BACKEND_URL   = os.getenv("RESILIENCE_BACKEND", "http://localhost:8000")
+ORG_ID        = os.getenv("ORG_ID", "default")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,73 +36,75 @@ logging.basicConfig(
 log = logging.getLogger("resilience")
 
 
-def _load_context(pipeline_name: str) -> str:
-    ctx_dir = CONTEXT_ROOT / pipeline_name
-    parts = []
-    for fname in ["schema.txt", "known-issues.txt"]:
-        fpath = ctx_dir / fname
-        if fpath.exists():
-            parts.append(f"=== {fname} ===\n{fpath.read_text()}")
-    return "\n\n".join(parts)
-
-
-def _ask_llm(error: Exception, tb: str, context: str) -> str:
-    prompt = f"""You are a data engineering assistant. An ETL pipeline failed with the error below.
-Using the schema and known issues provided, suggest a specific, actionable fix.
-
-ERROR:
-{type(error).__name__}: {error}
-
-TRACEBACK:
-{tb}
-
-PIPELINE CONTEXT:
-{context}
-
-Respond with:
-1. Root cause (one sentence)
-2. Suggested fix (specific code change or data correction)
-3. Whether this should be a hard stop or can be handled gracefully"""
-
-    response = ollama.chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response["message"]["content"]
+def _submit_quarantine(pipeline_name: str, quarantine_df: pd.DataFrame, violations: dict) -> None:
+    """Post quarantined rows to backend for AI triage + human review (non-blocking)."""
+    try:
+        payload = {
+            "pipeline_name": pipeline_name,
+            "row_count":     len(quarantine_df),
+            "violations":    violations,
+            "sample_rows":   quarantine_df.head(20).to_dict(orient="records"),
+        }
+        resp = requests.post(f"{BACKEND_URL}/api/quarantine", json=payload, timeout=10)
+        resp.raise_for_status()
+        batch_id = resp.json().get("batch_id", "?")
+        log.info(f"[{pipeline_name}] Quarantine batch submitted — {len(quarantine_df)} rows (batch {batch_id[:8]})")
+    except Exception as e:
+        log.warning(f"[{pipeline_name}] Backend unreachable, saving quarantine locally: {e}")
+        Path("data").mkdir(exist_ok=True)
+        quarantine_df.to_csv("data/quarantine.csv", index=False)
 
 
 def resilient_pipeline(name: str):
-    """
-    Decorator factory. Wraps a pipeline function with failure interception and LLM-assisted diagnosis.
-
-    Usage:
-        @resilient_pipeline(name="nyc-taxi")
-        def run(): ...
-    """
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            csv_path = os.getenv("CSV_PATH", "data/nyc_taxi_sample.csv")
             log.info(f"[{name}] Starting: {fn.__name__}")
+
+            # 1. Load raw data
+            raw_df = pd.read_csv(csv_path)
+            log.info(f"[{name}] Loaded {len(raw_df)} raw rows")
+
+            # 2. Validate + split
+            rules = load_rules(name, org_id=ORG_ID)
+            if not rules:
+                log.warning(
+                    f"[{name}] No validation rules found. "
+                    "Run learn_from_sample.py first to generate rules from known-good data."
+                )
+            else:
+                log.info(f"[{name}] Validating with {len(rules)} rules")
+                clean_df, quarantine_df, violations = validate_and_split(raw_df, rules)
+
+                auto_fixed   = sum(1 for v in violations.values() if v.get("auto_fixed"))
+                n_quarantine = len(quarantine_df)
+                log.info(
+                    f"[{name}] {len(clean_df)} rows clean, "
+                    f"{auto_fixed} columns auto-fixed, "
+                    f"{n_quarantine} rows quarantined"
+                )
+
+                # 3. Write clean data back so the pipeline reads it
+                clean_df.to_csv(csv_path, index=False)
+
+                # 4. Submit quarantine batch (non-blocking)
+                if n_quarantine > 0:
+                    _submit_quarantine(name, quarantine_df, violations)
+
+            # 5. Run pipeline on clean data — should succeed
             try:
                 result = fn(*args, **kwargs)
-                log.info(f"[{name}] Completed successfully")
+                n = len(clean_df) if rules else len(raw_df)
+                log.info(f"[{name}] Pipeline succeeded on {n} rows")
                 return result
             except Exception as e:
-                tb = traceback.format_exc()
-                log.error(f"[{name}] FAILURE — {type(e).__name__}: {e}")
-                log.error(f"[{name}] Traceback:\n{tb}")
-
-                context = _load_context(name)
-                if not context:
-                    log.warning(f"[{name}] No context found at pipeline-context/{name}/")
-
-                log.info(f"[{name}] Querying Ollama ({MODEL}) for fix suggestion...")
-                try:
-                    suggestion = _ask_llm(e, tb, context)
-                    log.info(f"[{name}] LLM suggestion:\n{'='*60}\n{suggestion}\n{'='*60}")
-                except Exception as llm_err:
-                    log.error(f"[{name}] Ollama call failed: {llm_err}")
-
+                # Unexpected failure: data passed validation but pipeline still broke.
+                # This means either a rule is missing or the pipeline has a bug.
+                log.error(
+                    f"[{name}] Unexpected failure — no rule caught this. "
+                    f"Consider adding a rule. {type(e).__name__}: {e}"
+                )
                 raise
 
         return wrapper
